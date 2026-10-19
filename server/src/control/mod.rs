@@ -10,14 +10,12 @@ mod settings;
 use axum::{
     body::{to_bytes, Body},
     extract::State,
-    http::{header, header::CONTENT_TYPE, HeaderValue, Method, Request, Response, StatusCode},
+    http::{header, uri::Authority, Request, Response, StatusCode},
+    middleware::{self, Next},
     routing::{any, get, post, put},
     Router,
 };
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    services::ServeDir,
-};
+use tower_http::services::ServeDir;
 use url::{Host, Url};
 
 pub use service::{
@@ -26,16 +24,66 @@ pub use service::{
 };
 
 pub fn web_router(service: ControlService, assets: impl AsRef<std::path::Path>) -> Router {
-    Router::new()
-        .nest_service(
-            "/__byok-api__",
-            ServeDir::new(assets).append_index_html_on_directories(true),
-        )
-        .merge(api_router(service))
+    local_host_only(
+        Router::new()
+            .nest_service(
+                "/__byok-api__",
+                ServeDir::new(assets).append_index_html_on_directories(true),
+            )
+            .merge(api_routes(service)),
+    )
 }
 
 pub fn proxy_web_router(service: ControlService, target: Url) -> Router {
-    frontend_proxy_router(target).merge(api_router(service))
+    local_host_only(frontend_proxy_router(target).merge(api_routes(service)))
+}
+
+pub fn api_router(service: ControlService) -> Router {
+    local_host_only(api_routes(service))
+}
+
+/// Serves control routes only to requests addressed to `localhost` or an IP literal.
+///
+/// The control UI is same-origin with this API, so no cross-origin access is
+/// granted. A DNS-rebinding page reaches the server under its own domain name,
+/// which arrives as the Host; rejecting every other domain keeps such pages away
+/// from API keys and settings while desktop, development, and IP-addressed
+/// Docker access keep working.
+pub fn local_host_only(router: Router) -> Router {
+    router.layer(middleware::from_fn(require_local_host))
+}
+
+async fn require_local_host(request: Request<Body>, next: Next) -> Response<Body> {
+    if request_host(&request).as_ref().is_some_and(local_host) {
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        host = ?request.headers().get(header::HOST),
+        path = request.uri().path(),
+        "rejected control request for a non-local host"
+    );
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Body::from(
+            "the control API only accepts localhost or IP address hosts",
+        ))
+        .expect("static forbidden response")
+}
+
+/// Reads the HTTP/1 Host header, or the HTTP/2 `:authority` carried in the URI.
+fn request_host(request: &Request<Body>) -> Option<Host> {
+    let authority = match request.headers().get(header::HOST) {
+        Some(value) => value.to_str().ok()?.parse::<Authority>().ok()?,
+        None => request.uri().authority()?.clone(),
+    };
+    Host::parse(authority.host()).ok()
+}
+
+fn local_host(host: &Host) -> bool {
+    match host {
+        Host::Domain(domain) => domain == "localhost",
+        Host::Ipv4(_) | Host::Ipv6(_) => true,
+    }
 }
 
 fn frontend_proxy_router(target: Url) -> Router {
@@ -108,7 +156,7 @@ fn proxy_error(error: impl std::fmt::Display) -> Response<Body> {
         .expect("static proxy error response")
 }
 
-pub fn api_router(service: ControlService) -> Router {
+fn api_routes(service: ControlService) -> Router {
     Router::new()
         .route(
             "/__byok-api__/api/models",
@@ -219,45 +267,73 @@ pub fn api_router(service: ControlService) -> Router {
             put(harness::set_enabled),
         )
         .with_state(service)
-        .layer(desktop_cors())
 }
 
-fn desktop_cors() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _| local_origin(origin)))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([CONTENT_TYPE, header::ACCEPT_LANGUAGE])
-}
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
 
-fn local_origin(origin: &HeaderValue) -> bool {
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    if origin.eq_ignore_ascii_case("tauri://localhost") {
-        return true;
+    use super::local_host_only;
+
+    async fn status(uri: &str, host: Option<&str>) -> StatusCode {
+        let routes = Router::new().route("/models", get(|| async { "models" }));
+        let mut request = Request::builder().uri(uri);
+        if let Some(host) = host {
+            request = request.header(header::HOST, host);
+        }
+        local_host_only(routes)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
     }
-    let Ok(origin) = Url::parse(origin) else {
-        return false;
-    };
-    if !matches!(origin.scheme(), "http" | "https")
-        || !origin.username().is_empty()
-        || origin.password().is_some()
-        || origin.path() != "/"
-        || origin.query().is_some()
-        || origin.fragment().is_some()
-    {
-        return false;
+
+    #[tokio::test]
+    async fn accepts_localhost_and_ip_literal_hosts() {
+        for host in [
+            "127.0.0.1:3000",
+            "localhost:3000",
+            "LOCALHOST",
+            "[::1]:3000",
+            "192.168.1.10:3000",
+            "10.0.0.2",
+        ] {
+            assert_eq!(
+                status("/models", Some(host)).await,
+                StatusCode::OK,
+                "{host}"
+            );
+        }
     }
-    match origin.host() {
-        Some(Host::Domain(host)) => {
-            host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("tauri.localhost")
+
+    #[tokio::test]
+    async fn accepts_http2_authority_without_host_header() {
+        assert_eq!(
+            status("http://127.0.0.1:3000/models", None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_domain_and_missing_hosts() {
+        for host in [
+            "rebind.example.com:3000",
+            "localhost.example.com",
+            "nas.local:3000",
+            "not a host",
+        ] {
+            assert_eq!(
+                status("/models", Some(host)).await,
+                StatusCode::FORBIDDEN,
+                "{host}"
+            );
         }
-        Some(Host::Ipv4(address)) => {
-            address.is_loopback() || address.is_private() || address.is_link_local()
-        }
-        Some(Host::Ipv6(address)) => {
-            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
-        }
-        None => false,
+        assert_eq!(status("/models", None).await, StatusCode::FORBIDDEN);
     }
 }

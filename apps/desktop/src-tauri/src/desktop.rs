@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(dev)]
 use cursor_server::config::ConsoleSource;
-use cursor_server::{App, Config, Result};
+use cursor_server::{control, App, Config, Result};
 
 #[cfg(not(dev))]
 use crate::frontend;
@@ -107,12 +107,14 @@ async fn open_external_url_handler(
 }
 
 fn desktop_api_router(app: AppHandle) -> Router {
-    Router::new()
-        .route(
-            "/__byok-api__/api/desktop/open-external-url",
-            post(open_external_url_handler),
-        )
-        .layer(Extension(app))
+    control::local_host_only(
+        Router::new()
+            .route(
+                "/__byok-api__/api/desktop/open-external-url",
+                post(open_external_url_handler),
+            )
+            .layer(Extension(app)),
+    )
 }
 
 fn create_main_window(

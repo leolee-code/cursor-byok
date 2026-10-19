@@ -7,13 +7,16 @@ use axum::{
     routing::get,
     Router,
 };
+use cursor_server::control;
 use tauri::AppHandle;
 
 pub(crate) fn router(app: AppHandle) -> Router {
-    Router::new()
-        .route("/__byok-api__/", get(asset))
-        .route("/__byok-api__/{*path}", get(asset))
-        .with_state(app)
+    control::local_host_only(
+        Router::new()
+            .route("/__byok-api__/", get(asset))
+            .route("/__byok-api__/{*path}", get(asset))
+            .with_state(app),
+    )
 }
 
 async fn asset(State(app): State<AppHandle>, uri: Uri) -> Response<Body> {
