@@ -32,16 +32,26 @@ pub(super) enum InteractionContinuation {
     Pending,
 }
 
+pub(super) struct StartDependencies<'a> {
+    pub runtime: &'a CursorToolRuntime,
+    pub results: &'a ToolResultSender,
+    pub web_search: &'a WebSearch,
+    pub store: Option<&'a Store>,
+}
+
 pub(super) async fn start(
-    runtime: &CursorToolRuntime,
-    results: &ToolResultSender,
+    dependencies: StartDependencies<'_>,
     call: &ToolCall,
     message_index: usize,
     dynamic_mcp: &BTreeMap<String, pb::McpToolDefinition>,
     context: &ExecContext,
-    web_search: &WebSearch,
-    store: Option<&Store>,
 ) -> Result<ToolStart> {
+    let StartDependencies {
+        runtime,
+        results,
+        web_search,
+        store,
+    } = dependencies;
     if let Some(definition) = dynamic_mcp.get(&call.name) {
         return exec::start_dynamic(runtime, call, definition, context).await;
     }

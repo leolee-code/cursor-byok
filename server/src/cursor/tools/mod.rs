@@ -197,14 +197,16 @@ impl ToolDispatcher {
             Vec::new()
         };
         let started = tool_call_dispatch::start(
-            &self.runtime,
-            &self.results,
+            tool_call_dispatch::StartDependencies {
+                runtime: &self.runtime,
+                results: &self.results,
+                web_search: &self.search,
+                store: self.store.as_ref(),
+            },
             &call,
             message_index,
             dynamic_mcp,
             context,
-            &self.search,
-            self.store.as_ref(),
         )
         .await?;
         messages.extend(started.messages);
