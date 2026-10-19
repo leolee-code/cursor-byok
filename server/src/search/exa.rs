@@ -339,7 +339,9 @@ mod tests {
             }
             let request = String::from_utf8(request).unwrap();
             assert!(request.starts_with("POST /search HTTP/1.1\r\n"));
-            assert!(request.to_ascii_lowercase().contains("x-api-key: exa-secret\r\n"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-api-key: exa-secret\r\n"));
             assert!(request
                 .to_ascii_lowercase()
                 .contains("content-type: application/json\r\n"));
