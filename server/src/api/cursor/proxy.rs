@@ -65,10 +65,7 @@ pub async fn forward(
     forward_request(&proxy, request).await
 }
 
-async fn forward_request(
-    proxy: &CursorProxy,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
+async fn forward_request(proxy: &CursorProxy, request: Request<Body>) -> Result<Response<Body>> {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
     let path = parts

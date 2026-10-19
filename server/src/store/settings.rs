@@ -199,10 +199,9 @@ impl Store {
         .bind(WEB_SEARCH_SETTINGS_KEY)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(value.as_deref().map_or_else(
-            WebSearchSettingsSecret::default,
-            read_web_search_settings,
-        ))
+        Ok(value
+            .as_deref()
+            .map_or_else(WebSearchSettingsSecret::default, read_web_search_settings))
     }
 
     pub async fn web_search_settings(&self) -> Result<WebSearchSettings> {

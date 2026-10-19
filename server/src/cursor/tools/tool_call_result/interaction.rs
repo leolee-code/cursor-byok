@@ -177,8 +177,7 @@ pub(crate) fn complete_web_search(
             let output = if hits.is_empty() {
                 "No web search results found.".into()
             } else {
-                hits
-                    .iter()
+                hits.iter()
                     .enumerate()
                     .map(|(index, hit)| {
                         format!(

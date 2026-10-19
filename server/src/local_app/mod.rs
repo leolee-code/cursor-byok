@@ -187,9 +187,7 @@ impl CursorHarness {
         }
         let ca = self.inner.ca.load()?;
         let requested_port = self.inner.store.port_settings().await?.proxy_port;
-        let (url, actual_port) = proxy
-            .start(backend_addr, ca, requested_port)
-            .await?;
+        let (url, actual_port) = proxy.start(backend_addr, ca, requested_port).await?;
         if let Err(error) = self.inner.store.set_proxy_port(actual_port).await {
             proxy.stop().await;
             return Err(error);
