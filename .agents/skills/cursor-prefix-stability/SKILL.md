@@ -35,7 +35,12 @@ Do not solve prefix instability independently in each provider adapter. Produce 
   - never represent a context change by rewriting the system prompt, replacing an earlier context message, or mutating a checkpoint root.
 - Give every appended context update a unique event identity. Compare the latest context by content, not only by identifier, so `A → B → A` appends the final `A` again while retries of the same event remain idempotent.
 - Preserve `request-context:*` wire identity through checkpoint encoding and hydration. Deduplication must still work after process restart or conversation resume.
-- Automatic compaction is an explicit prefix reset. Compact obsolete history, retain exactly the latest request-context message, then place the summary and current initial messages in deterministic order. Manual compaction may reproject current context on the next user turn.
+- Automatic compaction is an explicit prefix reset, done in `run/compaction.rs`:
+  - it first prunes the middle of oversized tool results in place; when that alone brings the estimate under budget, the pruned history replaces the old one and no summary is made;
+  - otherwise it keeps a recent tail verbatim, cut only where every tool call before the cut has its result, and summarizes the head before it;
+  - the summary request replays the main request unchanged (instructions, tools, reasoning, and the head as a prefix of the history) and appends the instruction as one final user message, so the provider prefix cache stays warm;
+  - the replacement is, in order: the latest request-context if it was in the head, the summary, current initial messages that were in the head, then the tail unchanged (a request-context inside the tail stays in place).
+- Manual compaction sends the same summary request over the whole history and replaces it with the summary; it may reproject current context on the next user turn.
 - Background completions and injected runtime events must not manufacture duplicate request context unless they actually start a user turn whose context changed.
 
 ## Change workflow
@@ -64,7 +69,7 @@ Cover the affected behavior with structural assertions, not token-count estimate
 - Context reversion `A → B → A`: three distinct context events are retained in order.
 - Retry of one runtime event: no duplicate or conflicting context message is persisted.
 - Checkpoint round-trip: request-context identity and content survive encode/hydrate.
-- Automatic compaction: only the latest context is retained outside the summary.
+- Automatic compaction: the summary request's history is the head of the main request's history plus one instruction message, with the same instructions and tools; the retained tail is unchanged and starts at a tool-round boundary; outside the tail only the latest context precedes the summary.
 - Runtime templates render without embedding conversation-level rules or MCP metadata in every user query.
 
 Run focused tests first, then the relevant server suites:

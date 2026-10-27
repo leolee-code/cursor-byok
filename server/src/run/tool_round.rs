@@ -1,5 +1,5 @@
 //! Executes one logical round of Tool calls and results.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +18,8 @@ pub(super) struct ToolRound {
     pub assistant: ToolRoundAssistant,
     pub calls: Vec<ToolCall>,
     pub recovered_started_at_ms: Option<u64>,
+    /// Text appended to a call's result, by call id (see `repeat_guard`).
+    pub reminders: HashMap<String, String>,
 }
 
 pub(super) async fn execute(
@@ -34,6 +36,7 @@ pub(super) async fn execute(
         assistant,
         calls,
         recovered_started_at_ms,
+        reminders,
     } = round;
     store
         .create_tool_round(
@@ -80,10 +83,13 @@ pub(super) async fn execute(
             command = client.commands.recv() => command,
         };
         match command {
-            Some(RunCommand::ToolResult(result)) => {
+            Some(RunCommand::ToolResult(mut result)) => {
                 let call_id = result.call_id.clone();
                 if completed_call_ids.contains(&call_id) {
                     continue;
+                }
+                if let Some(reminder) = reminders.get(&call_id) {
+                    result.content = format!("{}\n\n{reminder}", result.content);
                 }
                 let committed = store
                     .commit_tool_result(

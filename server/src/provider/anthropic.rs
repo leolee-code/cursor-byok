@@ -362,6 +362,7 @@ fn anthropic_messages(messages: &[ProjectedMessage]) -> Result<Vec<Value>> {
                         "type": "tool_result",
                         "tool_use_id": result.call_id,
                         "content": content,
+                        "is_error": result.is_error,
                     })],
                 );
             }
@@ -505,6 +506,27 @@ fn anthropic_usage(value: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_results_say_whether_the_tool_failed() {
+        let result = |call_id: &str, is_error| ProjectedMessage {
+            message_id: call_id.into(),
+            role: Role::Tool,
+            content: ProjectedContent::ToolResult(crate::model::ToolResultContent {
+                call_id: call_id.into(),
+                name: "Shell".into(),
+                content: "output".into(),
+                is_error,
+                image: None,
+                provider_parts: Vec::new(),
+            }),
+        };
+        let messages =
+            anthropic_messages(&[result("failed", true), result("passed", false)]).unwrap();
+        let blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["is_error"], true);
+        assert_eq!(blocks[1]["is_error"], false);
+    }
 
     #[test]
     fn cached_tokens_are_included_once_in_anthropic_context_input() {

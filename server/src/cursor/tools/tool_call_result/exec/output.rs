@@ -45,7 +45,7 @@ fn shell(value: &pb::ShellResult) -> Result<(String, bool)> {
             ));
         }
         R::Success(success) => return Ok((streams(&success.stdout, &success.stderr), false)),
-        R::Failure(failure) => streams(&failure.stdout, &failure.stderr),
+        R::Failure(failure) => failure_output(failure),
         R::Timeout(timeout) => format!(
             "shell timed out after {}ms in {}",
             timeout.timeout_ms, timeout.working_directory
@@ -55,6 +55,40 @@ fn shell(value: &pb::ShellResult) -> Result<(String, bool)> {
         R::PermissionDenied(denied) => denied.error.clone(),
     };
     Ok((output, true))
+}
+
+/// A failed command's output, then a marker for why it failed, last of all the
+/// exit code. The Shell tool description asks the model to check the marker;
+/// some providers ignore the tool result's error flag, so the text is the only
+/// signal they see. Markers follow deepseek-harness's bash tool.
+fn failure_output(failure: &pb::ShellFailure) -> String {
+    let mut markers = Vec::new();
+    if failure.aborted {
+        markers.push(
+            match failure
+                .abort_reason
+                .and_then(|reason| pb::ShellAbortReason::try_from(reason).ok())
+            {
+                Some(pb::ShellAbortReason::Timeout) => "[timed out]".to_string(),
+                Some(pb::ShellAbortReason::UserAbort) => "[stopped: by the user]".to_string(),
+                _ => "[stopped]".to_string(),
+            },
+        );
+    }
+    if !failure.signal.is_empty() {
+        markers.push(format!("[killed by signal: {}]", failure.signal));
+    } else if failure.exit_code != 0 {
+        markers.push(format!("[exit code: {}]", failure.exit_code));
+    }
+    let output = if failure.stdout.is_empty() && failure.stderr.is_empty() {
+        "(no output)".to_string()
+    } else {
+        streams(&failure.stdout, &failure.stderr)
+    };
+    if markers.is_empty() {
+        return output;
+    }
+    format!("{output}\n{}", markers.join("\n"))
 }
 
 fn streams(stdout: &str, stderr: &str) -> String {
@@ -487,6 +521,71 @@ mod tests {
         assert!(
             content.contains("b.ts") && content.contains("c.ts"),
             "unchecked paths must be reported, got: {content}"
+        );
+    }
+
+    fn shell_failure(failure: pb::ShellFailure) -> pb::exec_client_message::Message {
+        pb::exec_client_message::Message::ShellResult(pb::ShellResult {
+            result: Some(pb::shell_result::Result::Failure(failure)),
+            ..Default::default()
+        })
+    }
+
+    fn shell_call() -> ToolCall {
+        ToolCall {
+            index: 0,
+            call_id: "shell".into(),
+            model_call_id: "model:0".into(),
+            name: "Shell".into(),
+            arguments_text: String::new(),
+            arguments: json!({ "command": "cargo test" }),
+            argument_error: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_command_ends_with_its_exit_code() {
+        let message = shell_failure(pb::ShellFailure {
+            exit_code: 101,
+            stdout: "running 3 tests\n".into(),
+            stderr: "test failed".into(),
+            ..Default::default()
+        });
+        let (content, is_error) = output(&message, &shell_call()).unwrap();
+        assert!(is_error);
+        assert_eq!(
+            content,
+            "running 3 tests\n\n\n<stderr>\ntest failed\n</stderr>\n[exit code: 101]"
+        );
+    }
+
+    #[test]
+    fn a_silent_failure_still_says_how_it_failed() {
+        // Without output the model used to read "shell completed without
+        // output" for a command that had failed.
+        let (content, _) = output(
+            &shell_failure(pb::ShellFailure {
+                exit_code: 1,
+                ..Default::default()
+            }),
+            &shell_call(),
+        )
+        .unwrap();
+        assert_eq!(content, "(no output)\n[exit code: 1]");
+
+        let (content, _) = output(
+            &shell_failure(pb::ShellFailure {
+                signal: "SIGKILL".into(),
+                aborted: true,
+                abort_reason: Some(pb::ShellAbortReason::Timeout as i32),
+                ..Default::default()
+            }),
+            &shell_call(),
+        )
+        .unwrap();
+        assert_eq!(
+            content,
+            "(no output)\n[timed out]\n[killed by signal: SIGKILL]"
         );
     }
 

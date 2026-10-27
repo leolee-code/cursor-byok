@@ -10,6 +10,7 @@ mod messages;
 mod model_cycle;
 mod model_retry;
 mod port;
+mod repeat_guard;
 mod tool_round;
 
 pub use command::*;

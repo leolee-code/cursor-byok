@@ -1221,13 +1221,13 @@ async fn injected_user_context_interrupts_automatic_compaction() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert!(
+    assert_eq!(
         requests[1]
-            .prompt
-            .instructions
-            .starts_with("Summarize the conversation for the next model turn."),
-        "second request was not compaction: instructions={:?}, history={:?}",
-        requests[1].prompt.instructions,
+            .history
+            .last()
+            .map(|message| message.message_id.as_str()),
+        Some("compaction:instruction"),
+        "second request was not compaction: history={:?}",
         requests[1].history
     );
     assert!(!serde_json::to_string(&requests[1].history)

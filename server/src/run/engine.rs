@@ -1,5 +1,4 @@
 //! Executes one Run across model cycles, Tool rounds, and message commits.
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -14,10 +13,8 @@ use crate::{
 };
 
 use super::{
-    consume_model_cycle,
-    model_retry::{should_retry, MODEL_RETRY_DELAY},
-    CommitBarrier, CommitCause, MessagesCommitted, RunCommand, RunEvent, RunFailure, RunOutcome,
-    RunPort,
+    consume_model_cycle, CommitBarrier, CommitCause, MessagesCommitted, RunCommand, RunEvent,
+    RunFailure, RunOutcome, RunPort,
 };
 
 pub struct RunEngine {
@@ -167,6 +164,7 @@ impl RunEngine {
                     assistant: round.assistant.clone(),
                     calls: round.calls.clone(),
                     recovered_started_at_ms: Some(round.started_at_ms),
+                    reminders: Default::default(),
                 },
                 Vec::new(),
             )
@@ -209,7 +207,14 @@ impl RunEngine {
                     return (client_failure(), usage);
                 }
                 match self
-                    .auto_compact(prepared, checkpoint, &messages, client, cancellation)
+                    .auto_compact(
+                        prepared,
+                        checkpoint,
+                        &messages,
+                        Some(estimated_tokens),
+                        client,
+                        cancellation,
+                    )
                     .await
                 {
                     Ok((next_checkpoint, compaction_usage)) => {
@@ -239,19 +244,23 @@ impl RunEngine {
             // The usage anchor counts persisted messages only; a transient
             // tail is provider-visible but never committed.
             let anchored_messages = history.len();
-            let history = if prepared.action == RunAction::Compact {
-                super::history::user_terminated(
+            let request = if prepared.action == RunAction::Compact {
+                super::compaction::summary_request(
+                    &prepared.prompt,
+                    &prepared.model,
                     history,
-                    "compaction:instruction",
-                    super::compaction::INSTRUCTIONS,
+                    &Default::default(),
                 )
             } else {
-                super::history::user_terminated(history, CONTINUE_MESSAGE_ID, CONTINUE_INSTRUCTION)
-            };
-            let request = crate::model::ModelRequest {
-                prompt: prepared.prompt.clone(),
-                model: prepared.model.clone(),
-                history,
+                crate::model::ModelRequest {
+                    prompt: prepared.prompt.clone(),
+                    model: prepared.model.clone(),
+                    history: super::history::user_terminated(
+                        history,
+                        CONTINUE_MESSAGE_ID,
+                        CONTINUE_INSTRUCTION,
+                    ),
+                }
             };
             let mut retries = 0_u32;
             let mut pending_insertions = Vec::new();
@@ -421,7 +430,14 @@ impl RunEngine {
                                     Err(error) => return (RunOutcome::Failed(error.into()), usage),
                                 };
                             match self
-                                .auto_compact(prepared, checkpoint, &messages, client, cancellation)
+                                .auto_compact(
+                                    prepared,
+                                    checkpoint,
+                                    &messages,
+                                    None,
+                                    client,
+                                    cancellation,
+                                )
                                 .await
                             {
                                 Ok((next_checkpoint, compaction_usage)) => {
@@ -435,16 +451,17 @@ impl RunEngine {
                                 Err(outcome) => return (outcome, usage),
                             }
                         }
-                        if !should_retry(&cycle_failure, retries) {
+                        let Some(delay) = super::model_retry::retry_delay(&cycle_failure, retries)
+                        else {
                             return (RunOutcome::Failed(cycle_failure.failure), usage);
-                        }
+                        };
                         retries += 1;
                         let message = failure_message(&cycle_failure.failure);
                         tracing::warn!(
                             provider_call_index,
                             retries,
                             max_retries = super::model_retry::MAX_MODEL_RETRIES,
-                            delay_ms = MODEL_RETRY_DELAY.as_millis() as u64,
+                            delay_ms = delay.as_millis() as u64,
                             %message,
                             checkpoint_id = checkpoint.0,
                             "model attempt failed; retrying from current checkpoint"
@@ -462,7 +479,7 @@ impl RunEngine {
                             return (client_failure(), usage);
                         }
 
-                        let delay = tokio::time::sleep(MODEL_RETRY_DELAY);
+                        let delay = tokio::time::sleep(delay);
                         tokio::pin!(delay);
                         loop {
                             tokio::select! {
@@ -539,14 +556,8 @@ impl RunEngine {
             }
 
             if prepared.action == RunAction::Compact {
-                if !cycle.calls.is_empty() {
-                    return (
-                        RunOutcome::Failed(RunFailure::Protocol(
-                            "compaction model returned tool calls".into(),
-                        )),
-                        usage,
-                    );
-                }
+                // The summary call offers the conversation's tools to keep its
+                // prefix cached; any call the model makes anyway is ignored.
                 let summary = cycle.text.trim().to_string();
                 if summary.is_empty() {
                     return (
@@ -563,9 +574,7 @@ impl RunEngine {
                     origin: Origin::Runtime,
                     content: MessageContent::Parts {
                         parts: vec![crate::model::ContentPart::Text {
-                            text: format!(
-                                "<conversation_summary>\n{summary}\n</conversation_summary>"
-                            ),
+                            text: super::compaction::summary_text(&summary),
                         }],
                     },
                     runtime_event_id: Some(event_id),
@@ -732,6 +741,7 @@ impl RunEngine {
 
             let round_id =
                 ToolRoundId::new(format!("{}:round:{provider_call_index}", prepared.run_id));
+            let reminders = super::repeat_guard::reminders(&messages, &cycle.calls);
             checkpoint = match super::tool_round::execute(
                 &self.store,
                 prepared,
@@ -748,6 +758,7 @@ impl RunEngine {
                     },
                     calls: cycle.calls,
                     recovered_started_at_ms: None,
+                    reminders,
                 },
                 pending_insertions,
             )
@@ -759,24 +770,59 @@ impl RunEngine {
         }
     }
 
+    /// Compacts the history before a model call that would not fit.
+    ///
+    /// `estimated_tokens` is the estimate that triggered compaction; it is
+    /// `None` when the provider refused the prompt as too long, and then
+    /// pruning alone is never trusted to make it fit.
     async fn auto_compact(
         &self,
         prepared: &PreparedRun,
         checkpoint: crate::model::CheckpointId,
         messages: &[CanonicalMessage],
+        estimated_tokens: Option<u64>,
         client: &mut RunPort,
         cancellation: &CancellationToken,
     ) -> std::result::Result<(crate::model::CheckpointId, Option<Usage>), RunOutcome> {
-        let current_ids = prepared
-            .initial_messages
-            .iter()
-            .map(|message| message.message_id.as_str())
-            .collect::<HashSet<_>>();
-        let (compactable, retained_request_context) =
-            super::compaction::partition(messages, &current_ids);
-        if compactable.is_empty() {
-            let projected = crate::model::project_messages(messages)
-                .map_err(|error| RunOutcome::Failed(error.into()))?;
+        let failed = |error: crate::Error| RunOutcome::Failed(error.into());
+        let pruned = super::compaction::prune_tool_results(messages);
+        if let (Some(pruned), Some(estimated_tokens), Some(budget)) = (
+            pruned.as_deref(),
+            estimated_tokens,
+            super::compaction::input_budget(prepared),
+        ) {
+            let before = crate::model::estimate_context_tokens(
+                &prepared.prompt,
+                &crate::model::project_messages(messages).map_err(failed)?,
+            );
+            let after = crate::model::estimate_context_tokens(
+                &prepared.prompt,
+                &crate::model::project_messages(pruned).map_err(failed)?,
+            );
+            let remaining = estimated_tokens.saturating_sub(before.saturating_sub(after));
+            if remaining <= budget {
+                tracing::info!(
+                    estimated_tokens,
+                    remaining,
+                    "pruned oversized tool results instead of summarizing"
+                );
+                return self
+                    .commit_pruned(
+                        prepared,
+                        checkpoint,
+                        pruned,
+                        remaining,
+                        client,
+                        cancellation,
+                    )
+                    .await
+                    .map(|checkpoint| (checkpoint, None));
+            }
+        }
+        let messages = pruned.as_deref().unwrap_or(messages);
+        let partition = super::compaction::partition(prepared, messages).map_err(failed)?;
+        if partition.is_empty() {
+            let projected = crate::model::project_messages(messages).map_err(failed)?;
             let message = super::compaction::validate_compacted(prepared, &projected)
                 .err()
                 .unwrap_or_else(|| {
@@ -793,29 +839,22 @@ impl RunEngine {
             .store
             .begin_provider_call(&prepared.run_id)
             .await
-            .map_err(|error| RunOutcome::Failed(error.into()))?;
-        let history = crate::model::project_messages(&compactable)
-            .map(|history| {
-                super::compaction::compaction_history(history, prepared.model.context_window_tokens)
-            })
-            .map_err(|error| RunOutcome::Failed(error.into()))?;
-        let mut model = prepared.model.clone();
-        model.max_output_tokens = Some(super::compaction::OUTPUT_TOKENS);
-        model.reasoning.enabled = false;
-        model.reasoning.effort = None;
+            .map_err(failed)?;
+        let mut history = crate::model::project_messages(&partition.head).map_err(failed)?;
+        hydrate_tool_images(&self.store, &mut history)
+            .await
+            .map_err(failed)?;
         let invocation = crate::model::ModelInvocation {
             call_id: format!("{}:{provider_call_index}", prepared.run_id),
             run_id: prepared.run_id.to_string(),
             conversation_id: prepared.conversation_id.to_string(),
             provider_call_index,
-            request: crate::model::ModelRequest {
-                prompt: crate::model::PromptSpec {
-                    instructions: super::compaction::INSTRUCTIONS.into(),
-                    tools: Vec::new(),
-                },
-                model,
+            request: super::compaction::summary_request(
+                &prepared.prompt,
+                &prepared.model,
                 history,
-            },
+                &partition.carried(),
+            ),
         };
         let cycle_cancellation = cancellation.child_token();
         let (silent_events, mut discarded_events) = tokio::sync::mpsc::channel(256);
@@ -867,27 +906,29 @@ impl RunEngine {
         let _ = drain.await;
         let (summary, compaction_usage) = match (break_messages.is_some(), cycle) {
             (true, Ok(cycle)) => (
-                super::compaction::fallback_summary(&compactable),
+                super::compaction::fallback_summary(&partition.head),
                 cycle.usage,
             ),
             (true, Err(failure)) => (
-                super::compaction::fallback_summary(&compactable),
+                super::compaction::fallback_summary(&partition.head),
                 failure.usage,
             ),
-            (false, Ok(cycle)) if cycle.calls.is_empty() && !cycle.text.trim().is_empty() => {
+            // Tool calls are ignored: the call offers the conversation's tools
+            // only to keep its prefix cached.
+            (false, Ok(cycle)) if !cycle.text.trim().is_empty() => {
                 (cycle.text.trim().to_string(), cycle.usage)
             }
             (false, Ok(cycle)) => {
                 tracing::warn!("automatic compaction returned no usable summary; using fallback");
                 (
-                    super::compaction::fallback_summary(&compactable),
+                    super::compaction::fallback_summary(&partition.head),
                     cycle.usage,
                 )
             }
             (false, Err(failure)) => {
                 tracing::warn!(error = ?failure.failure, "automatic compaction model failed; using fallback");
                 (
-                    super::compaction::fallback_summary(&compactable),
+                    super::compaction::fallback_summary(&partition.head),
                     failure.usage,
                 )
             }
@@ -899,16 +940,13 @@ impl RunEngine {
             origin: Origin::Runtime,
             content: MessageContent::Parts {
                 parts: vec![crate::model::ContentPart::Text {
-                    text: format!("<conversation_summary>\n{summary}\n</conversation_summary>"),
+                    text: super::compaction::summary_text(&summary),
                 }],
             },
             runtime_event_id: Some(event_id),
         };
-        let mut replacement = retained_request_context.into_iter().collect::<Vec<_>>();
-        replacement.push(summary_message);
-        replacement.extend(prepared.initial_messages.iter().cloned());
-        let projected_replacement = crate::model::project_messages(&replacement)
-            .map_err(|error| RunOutcome::Failed(error.into()))?;
+        let replacement = partition.replacement(summary_message);
+        let projected_replacement = crate::model::project_messages(&replacement).map_err(failed)?;
         super::compaction::validate_compacted(prepared, &projected_replacement)
             .map_err(|message| RunOutcome::Failed(RunFailure::Protocol(message)))?;
         let mut checkpoint = self
@@ -963,6 +1001,48 @@ impl RunEngine {
             .0;
         }
         Ok((checkpoint, compaction_usage))
+    }
+
+    /// Replaces the history with its pruned copy; no summary is made.
+    async fn commit_pruned(
+        &self,
+        prepared: &PreparedRun,
+        checkpoint: crate::model::CheckpointId,
+        pruned: &[CanonicalMessage],
+        estimated_tokens: u64,
+        client: &mut RunPort,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<crate::model::CheckpointId, RunOutcome> {
+        let checkpoint = self
+            .store
+            .replace_checkpoint(
+                &prepared.conversation_id,
+                &prepared.run_id,
+                checkpoint,
+                pruned,
+            )
+            .await
+            .map_err(|error| RunOutcome::Failed(error.into()))?;
+        let (barrier, ready) = CommitBarrier::before_continue();
+        emit(
+            client,
+            RunEvent::MessagesCommitted(MessagesCommitted {
+                checkpoint_id: checkpoint,
+                tool_round_version: 0,
+                cause: CommitCause::ToolResultsPruned,
+                barrier,
+            }),
+        )
+        .await
+        .map_err(|_| client_failure())?;
+        wait_for_state_ready(ready, cancellation).await?;
+        emit(
+            client,
+            RunEvent::UsageSnapshot(context_usage_snapshot(estimated_tokens)),
+        )
+        .await
+        .map_err(|_| client_failure())?;
+        Ok(checkpoint)
     }
 }
 

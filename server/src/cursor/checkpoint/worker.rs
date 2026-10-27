@@ -21,6 +21,9 @@ pub(crate) struct CheckpointJob {
 
 pub(crate) enum CheckpointKind {
     Settled(CheckpointId),
+    /// The history was rewritten in place, so its roots are rebuilt rather
+    /// than appended to.
+    Rewritten(CheckpointId),
     ToolStarted {
         round_id: ToolRoundId,
         stable_checkpoint_id: CheckpointId,
@@ -66,6 +69,17 @@ impl CheckpointWorker {
                     CheckpointKind::Settled(checkpoint_id)
                     | CheckpointKind::ToolSettled(checkpoint_id) => {
                         publish_settled(
+                            &store,
+                            &mut builder,
+                            &handle,
+                            mode,
+                            checkpoint_id,
+                            &presentation,
+                        )
+                        .await
+                    }
+                    CheckpointKind::Rewritten(checkpoint_id) => {
+                        publish_rewritten(
                             &store,
                             &mut builder,
                             &handle,
@@ -153,6 +167,20 @@ async fn publish_settled(
     presentation: &PendingSteps,
 ) -> Result<()> {
     let messages = store.load_checkpoint_messages(checkpoint_id).await?;
+    let checkpoint = builder.settled(&messages, mode, presentation).await?;
+    builder.publish(handle, &checkpoint).await
+}
+
+async fn publish_rewritten(
+    store: &Store,
+    builder: &mut CheckpointBuilder,
+    handle: &TransportHandle,
+    mode: i32,
+    checkpoint_id: CheckpointId,
+    presentation: &PendingSteps,
+) -> Result<()> {
+    let messages = store.load_checkpoint_messages(checkpoint_id).await?;
+    builder.replace_roots(&messages).await?;
     let checkpoint = builder.settled(&messages, mode, presentation).await?;
     builder.publish(handle, &checkpoint).await
 }

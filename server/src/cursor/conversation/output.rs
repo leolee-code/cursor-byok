@@ -699,10 +699,15 @@ impl ConversationOutput {
                         } else if !matches!(&state.cause, CommitCause::ToolResult { .. }) {
                             let requires_ready = state.barrier.is_required();
                             let (ready, published) = oneshot::channel();
+                            let kind = if state.cause == CommitCause::ToolResultsPruned {
+                                CheckpointKind::Rewritten(state.checkpoint_id)
+                            } else {
+                                CheckpointKind::Settled(state.checkpoint_id)
+                            };
                             worker
                                 .jobs
                                 .send(CheckpointJob {
-                                    kind: CheckpointKind::Settled(state.checkpoint_id),
+                                    kind,
                                     presentation: presentation.take(),
                                     context_tokens,
                                     ready: requires_ready.then_some(ready),

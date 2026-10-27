@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{model::ModelInvocation, Result};
 
 pub use anthropic::AnthropicProvider;
+pub(crate) use attempt::retry_after;
 pub use event::*;
 pub use openai_chat::OpenAiChatProvider;
 pub use openai_responses::OpenAiResponsesProvider;

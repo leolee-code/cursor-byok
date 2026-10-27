@@ -16,7 +16,6 @@ pub enum Mode {
     Debug,
     Multitask,
     Subagent,
-    Compaction,
 }
 
 impl Mode {
@@ -28,7 +27,6 @@ impl Mode {
             "debug" => Ok(Self::Debug),
             "multitask" => Ok(Self::Multitask),
             "subagent" => Ok(Self::Subagent),
-            "compaction" => Ok(Self::Compaction),
             other => Err(Error::Config(format!("unknown prompt mode: {other}"))),
         }
     }
@@ -41,7 +39,6 @@ impl Mode {
             Self::Debug => "debug",
             Self::Multitask => "multitask",
             Self::Subagent => "subagent",
-            Self::Compaction => "compaction",
         }
     }
 
@@ -53,7 +50,6 @@ impl Mode {
             Self::Debug => 3,
             Self::Multitask => 4,
             Self::Subagent => 5,
-            Self::Compaction => 6,
         }
     }
 }
@@ -67,7 +63,7 @@ pub struct ModeAssets {
 
 #[derive(Clone, Debug)]
 pub struct PromptAssets {
-    modes: [ModeAssets; 7],
+    modes: [ModeAssets; 6],
 }
 
 impl PromptAssets {
@@ -98,7 +94,7 @@ impl PromptAssets {
             &asset("tools.json")?
                 .ok_or_else(|| Error::Config("missing Cursor tools.json".into()))?,
         )?;
-        let mut modes = Vec::with_capacity(7);
+        let mut modes = Vec::with_capacity(6);
         for mode in [
             Mode::Agent,
             Mode::Ask,
@@ -106,7 +102,6 @@ impl PromptAssets {
             Mode::Debug,
             Mode::Multitask,
             Mode::Subagent,
-            Mode::Compaction,
         ] {
             let prompt = asset(&format!("{}/prompt.md", mode.name()))?
                 .ok_or_else(|| Error::Config(format!("missing prompt for {mode:?}")))?;

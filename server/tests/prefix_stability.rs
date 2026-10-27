@@ -194,7 +194,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "98bb57a9ade7f1a572c5c5fe77a905a129d28ecfd42b8d318250f6486b09e1ec",
+        "e7bb251ae348afca48614cc4544511f502ccdbbc36592283aa4000131a2ed349",
     );
     assert_mode(
         &assets,
@@ -216,7 +216,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "9a7e0f9e0bd8ef0af01032fa311686f72c42ec260e3057f6fae5e68f5ed36fb8",
+        "da54a902a942cf48333e1d88c6fa4a2d591e1e83be3633e7ddd3f681a565c66d",
     );
     assert_mode(
         &assets,
@@ -240,7 +240,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "98bb57a9ade7f1a572c5c5fe77a905a129d28ecfd42b8d318250f6486b09e1ec",
+        "e7bb251ae348afca48614cc4544511f502ccdbbc36592283aa4000131a2ed349",
     );
     assert_mode(
         &assets,
@@ -266,7 +266,7 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "976b309dd91e314d4916439ebb9da8995751d011532e39934a1da7593dc78ccb",
+        "0dafcbfa150bf8507b7329f3abe9e04a23dfff69ad00968c2bf856f234ec6f38",
     );
     assert_mode(
         &assets,
@@ -293,17 +293,11 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
             "SembleSearch",
             "SembleFindRelated",
         ],
-        "6de1ee86a131ca093c7143f54fffcba2fc14b32ff45fd6f5e0df1347058ad744",
-    );
-    assert_mode(
-        &assets,
-        Mode::Compaction,
-        &[],
-        "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "7420725417e29677475466d1b74baa744eaa1c0545213787282a5fb1335b3eeb",
     );
     assert_eq!(
         schema_digest(&assets.mode(Mode::Agent).tools),
-        "282a1dff7957090d0a75eac4a46474ac7cffa1b0937bdf97354544e729bb15c2"
+        "995226e24ad48b160eb6b1fa016c580a416cafcd5fe9bf317d768a3a0c869d89"
     );
     let task = assets
         .mode(Mode::Agent)
@@ -339,7 +333,6 @@ fn every_prompt_mode_loads_the_captured_tool_set() {
         Mode::Debug,
         Mode::Multitask,
         Mode::Subagent,
-        Mode::Compaction,
     ] {
         assert!(!assets
             .mode(mode)

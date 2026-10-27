@@ -146,7 +146,8 @@ async fn summarize_replaces_model_history_and_preserves_cursor_history() {
         &stored[0].content,
         MessageContent::Parts { parts }
             if matches!(parts.as_slice(), [ContentPart::Text { text }]
-                if text == "<conversation_summary>\nDurable summary\n</conversation_summary>")
+                if text.starts_with("This is an automatically generated checkpoint")
+                    && text.ends_with("<conversation_summary>\nDurable summary\n</conversation_summary>"))
     ));
 
     let after = run(
@@ -169,15 +170,14 @@ async fn summarize_replaces_model_history_and_preserves_cursor_history() {
         .starts_with(&compacted_state.root_prompt_messages_json));
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert!(requests[1].prompt.tools.is_empty());
-    assert!(requests[1]
-        .prompt
-        .instructions
-        .contains("compacting conversation history"));
-    assert_eq!(requests[1].history.len(), 3);
+    // The summary call replays the conversation's own request so the provider
+    // serves it from the prefix cache; only the final instruction is new.
+    assert_eq!(requests[1].prompt, requests[0].prompt);
+    assert!(requests[1].history.starts_with(&requests[0].history));
+    assert_eq!(requests[1].history.len(), requests[0].history.len() + 2);
     assert_eq!(
-        requests[1].history[2].message_id, "compaction:instruction",
-        "an assistant-terminated history gets the summarize instruction as its user tail"
+        requests[1].history.last().unwrap().message_id,
+        "compaction:instruction"
     );
     assert_eq!(requests[2].history.len(), 2);
     let ProjectedContent::Parts(summary_parts) = &requests[2].history[0].content else {
@@ -293,7 +293,12 @@ async fn automatic_compaction_preflights_provider_input_and_records_rebuilt_toke
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
     assert!(!requests[0].prompt.tools.is_empty());
-    assert!(requests[1].prompt.tools.is_empty());
+    assert_eq!(requests[1].prompt, requests[0].prompt);
+    assert!(requests[1].history.starts_with(&requests[0].history));
+    assert_eq!(
+        requests[1].history.last().unwrap().message_id,
+        "compaction:instruction"
+    );
     assert!(!requests[2].prompt.tools.is_empty());
     assert!(requests[1]
         .history
@@ -566,11 +571,11 @@ async fn provider_overflow_refusal_compacts_and_retries_once() {
         4,
         "refused call, summary call, retried call"
     );
-    assert!(requests[2].prompt.tools.is_empty());
+    assert_eq!(requests[2].prompt, requests[1].prompt);
     assert_eq!(
-        requests[2].history.last().unwrap().role,
-        Role::User,
-        "the summarizer history must end with a user message"
+        requests[2].history.last().unwrap().message_id,
+        "compaction:instruction",
+        "the summarizer history must end with the instruction"
     );
     assert!(!requests[3].prompt.tools.is_empty());
     assert!(requests[3]

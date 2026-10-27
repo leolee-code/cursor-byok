@@ -166,11 +166,9 @@ pub(crate) async fn prepare(
         &mut checkpoint_prompt,
         store.web_search_settings().await?.enabled,
     );
-    let prompt = if compacting {
-        compiler.prompt_spec(Mode::Compaction, &model, &[], false)?
-    } else {
-        checkpoint_prompt.clone()
-    };
+    // Manual compaction sends the conversation's own prompt so the summary
+    // call reuses the provider prefix cache (see `run/compaction.rs`).
+    let prompt = checkpoint_prompt.clone();
     let proposed_base_checkpoint_id = match base_messages.as_mut() {
         Some(messages) if !messages.is_empty() => {
             validate_prompt_root(messages)?;

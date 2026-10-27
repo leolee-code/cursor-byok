@@ -824,8 +824,13 @@ async fn unknown_exec_id_is_ignored() {
     assert!(matches!(result, codec::ClientExecEvent::Pending));
 }
 
-#[tokio::test]
-async fn one_run_can_auto_compact_again_after_more_tool_output() {
+/// Runs one turn in which the model reads the same file `reads` times, each
+/// read answered with `content`, and returns the provider requests.
+async fn answer_identical_reads(
+    context_window_tokens: u64,
+    reads: usize,
+    content: String,
+) -> Vec<cursor_server::model::ModelRequest> {
     let (_directory, store) = fixtures::temp_store().await;
     let model = store
         .create_model(&ModelConfigInput {
@@ -846,7 +851,7 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
             custom_headers: json!({}),
             anthropic_extra_params_enabled: false,
             anthropic_extra_params: json!({}),
-            context_window_tokens: Some(25_000),
+            context_window_tokens: Some(context_window_tokens),
             max_completion_tokens: None,
             anthropic_max_tokens: None,
             anthropic_thinking_effort: None,
@@ -855,10 +860,9 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
         .await
         .unwrap();
     let provider = fake_provider::FakeProvider::default();
-    provider.push(tool_call_response("repeat-call-1"));
-    provider.push(text_events("first summary"));
-    provider.push(tool_call_response("repeat-call-2"));
-    provider.push(text_events("second summary"));
+    for read in 0..reads {
+        provider.push(tool_call_response(&format!("repeat-call-{read}")));
+    }
     provider.push(text_events("done"));
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -888,7 +892,6 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
         .await
         .unwrap();
     let mut seqno = 1;
-    let oversized = format!("HEAD{}TAIL", "x".repeat(4 * 1024 * 1024));
     loop {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(10), output.recv())
             .await
@@ -896,6 +899,7 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
             .unwrap();
         let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
         if flags & connect::END_STREAM_FLAG != 0 {
+            assert_eq!(payload.as_ref(), b"{}", "the run must end successfully");
             break;
         }
         let server = pb::AgentServerMessage::decode(payload).unwrap();
@@ -926,10 +930,10 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
                                                 pb::ReadSuccess {
                                                     path: "/tmp/large.txt".into(),
                                                     total_lines: 1,
-                                                    file_size: oversized.len() as i64,
+                                                    file_size: content.len() as i64,
                                                     output: Some(
                                                         pb::read_success::Output::Content(
-                                                            oversized.clone(),
+                                                            content.clone(),
                                                         ),
                                                     ),
                                                     ..Default::default()
@@ -970,7 +974,17 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
         }
     }
 
-    let requests = provider.requests();
+    provider.requests()
+}
+
+#[tokio::test]
+async fn oversized_tool_output_is_pruned_instead_of_summarized() {
+    let requests = answer_identical_reads(
+        25_000,
+        2,
+        format!("HEAD{}TAIL", "x".repeat(4 * 1024 * 1024)),
+    )
+    .await;
     let shapes = requests
         .iter()
         .map(|request| {
@@ -988,12 +1002,46 @@ async fn one_run_can_auto_compact_again_after_more_tool_output() {
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(requests.len(), 5, "provider requests: {shapes:?}");
-    assert!(!requests[0].prompt.tools.is_empty());
-    assert!(requests[1].prompt.tools.is_empty());
-    assert!(!requests[2].prompt.tools.is_empty());
-    assert!(requests[3].prompt.tools.is_empty());
-    assert!(!requests[4].prompt.tools.is_empty());
+    // Each oversized result is cut to its first 4,096 and last 1,024
+    // characters, which is enough to fit, so no summary call is made.
+    let pruned = 4_096 + "\n\n[... tool result middle pruned ...]\n\n".len() + 1_024;
+    assert_eq!(requests.len(), 3, "provider requests: {shapes:?}");
+    assert!(requests
+        .iter()
+        .all(|request| request.prompt == requests[0].prompt));
+    assert_eq!(shapes[1].2, [pruned]);
+    assert_eq!(shapes[2].2, [pruned, pruned]);
+    assert!(requests[2]
+        .history
+        .iter()
+        .all(|message| match &message.content {
+            ProjectedContent::ToolResult(result) =>
+                result.content.starts_with("HEAD")
+                    && result
+                        .content
+                        .contains("[... tool result middle pruned ...]"),
+            _ => true,
+        }));
+}
+
+#[tokio::test]
+async fn the_third_identical_call_is_reminded_to_change_course() {
+    let requests = answer_identical_reads(1_000_000, 3, "contents".into()).await;
+    assert_eq!(requests.len(), 4);
+    let results = |request: &cursor_server::model::ModelRequest| {
+        request
+            .history
+            .iter()
+            .filter_map(|message| match &message.content {
+                ProjectedContent::ToolResult(result) => Some(result.content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(results(&requests[2]), ["contents", "contents"]);
+    let third = results(&requests[3]);
+    assert_eq!(third[..2], ["contents", "contents"]);
+    assert!(third[2].starts_with("contents\n\nYou are repeating the exact same tool call"));
 }
 
 #[tokio::test]

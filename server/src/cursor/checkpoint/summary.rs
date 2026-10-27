@@ -26,9 +26,14 @@ impl CheckpointBuilder {
             .map(|id| BlobId::from_bytes(id))
             .collect::<Result<Vec<_>>>()?;
         let root_ids = self.replace_roots(messages).await?;
-        let summary_message = root_ids
-            .last()
-            .filter(|_| root_ids.len() >= 2)
+        let projected = project_messages(messages)?;
+        // Roots are the projected messages after the system root, and the
+        // summary is followed by current messages and the retained tail.
+        let system_roots = usize::from(!self.instructions.is_empty());
+        let summary_message = projected
+            .iter()
+            .rposition(|message| message.message_id.starts_with("runtime:summary:"))
+            .and_then(|index| root_ids.get(index + system_roots))
             .ok_or_else(|| Error::Protocol("compaction produced no summary root".into()))?
             .clone();
 
@@ -85,7 +90,6 @@ impl CheckpointBuilder {
                 .push(archive_id.as_bytes().to_vec());
         }
         self.base.self_summary_count = self.base.self_summary_count.saturating_add(1);
-        let projected = project_messages(messages)?;
         let prompt = PromptSpec {
             instructions: self.instructions.clone(),
             tools: self.tool_definitions.clone(),

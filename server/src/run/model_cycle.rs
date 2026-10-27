@@ -310,6 +310,16 @@ pub async fn consume_model_cycle(
             usage,
         ));
     }
+    // A turn that ends normally with nothing in it is a provider hiccup, not
+    // an answer: retry it instead of ending the turn silently.
+    if text.is_empty() && reasoning.is_empty() && calls.is_empty() {
+        return Err(failure(
+            RunFailure::Provider("model returned an empty response".into()),
+            text,
+            reasoning,
+            usage,
+        ));
+    }
     let has_tool_calls = !calls.is_empty();
     if matches!(finish_reason, FinishReason::ToolUse) != has_tool_calls {
         return Err(failure(
@@ -491,14 +501,40 @@ mod tests {
         assert!(matches!(event, RunEvent::Usage(value) if value == usage));
         assert!(!cycle.is_finished(), "usage must arrive before Done");
 
-        provider_tx
-            .send(Ok(ModelEvent::Done(FinishReason::Stop)))
-            .await
-            .unwrap();
+        for event in [
+            ModelEvent::TextStart,
+            ModelEvent::TextDelta("answer".into()),
+            ModelEvent::TextEnd,
+            ModelEvent::Done(FinishReason::Stop),
+        ] {
+            provider_tx.send(Ok(event)).await.unwrap();
+        }
         drop(provider_tx);
         let result = cycle.await.unwrap().unwrap();
         assert_eq!(result.usage, Some(usage));
-        assert!(event_rx.try_recv().is_err(), "usage must be forwarded once");
+        let forwarded = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|event| matches!(event, RunEvent::Usage(_)))
+            .count();
+        assert_eq!(forwarded, 0, "usage must be forwarded once");
+    }
+
+    #[tokio::test]
+    async fn an_empty_response_is_a_retryable_failure() {
+        let stream = Box::pin(futures_util::stream::iter([
+            Ok(ModelEvent::Start {
+                model_call_id: "call".into(),
+            }),
+            Ok(ModelEvent::Done(FinishReason::Stop)),
+        ]));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let failure = consume_model_cycle(stream, &event_tx, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.failure,
+            RunFailure::Provider("model returned an empty response".into())
+        );
+        assert!(failure.retryable);
     }
 
     #[test]

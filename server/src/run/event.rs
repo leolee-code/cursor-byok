@@ -65,6 +65,7 @@ pub enum CommitCause {
     ToolResult { call_id: String, interrupted: bool },
     FinalTurn,
     Compaction { summary: String },
+    ToolResultsPruned,
     RuntimeEvent { event_id: String },
 }
 
